@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Easy netem management script
+# by Hornwitser
+set -e
+
+# filter-ip-sub DEV PARENT FILTER
+#
+# Add u32 filter to qdisc denoted by parent with the necessary
+# boilerplate for nexthdr to work.
+#
+# Note: this assumes only one filter used/needed
+# Note: does not support fragmented packets or IPv6.
+function filter-ip-sub {
+    DEV=$1
+    PARENT=$2
+    FILTER=$3
+
+    tc filter add dev $DEV $PARENT protocol ip prio 10 handle 1: u32 divisor 1
+    tc filter add dev $DEV $PARENT protocol ip prio 10 u32 ht 1: $FILTER
+
+    # Note, root hashtable id 800 is guessed here.
+    tc filter add dev $DEV $PARENT protocol ip prio 10 u32 ht 800: \
+        match ip nofrag offset at 0 mask 0f00 shift 6 link 1:
+}
+
+
+# setup-netem-egress DEV PORT REST_QDISC
+#
+# Adds netem qdisc filtered by PROT src PORT to DEV, handling the
+# remaning traffic with REST_QDISC.
+function setup-netem-egress {
+    DEV=$1
+    PROT=$2
+    PORT=$3
+    REST_QDISC=$4
+
+    tc qdisc add dev $DEV root handle 1: \
+        prio bands 2 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+    tc qdisc add dev $DEV parent 1:1 handle 10: $REST_QDISC
+    tc qdisc add dev $DEV parent 1:2 handle 20: netem
+
+    filter-ip-sub $DEV "parent 1:" "match $PROT src $PORT ffff classid 1:2"
+}
+
+# Check that the module is loaded and load it if not
+function kernel-mod {
+    MOD=$1
+    shift
+}
+
+# setup-netem-ingress DEV PORT IFB
+#
+# Create IFB if necessary and add netem qdisc to it.  Then sets up
+# filter on DEV ingress to redirect traffic matching PROT dst PORT to it.
+function setup-netem-ingress {
+    DEV=$1
+    PROT=$2
+    PORT=$3
+    IFB=$4
+
+    # If ifb is not loaded, load it ourself without any legacy ifb
+    # devices.  Otherwise a limited functionality legacy ifb0 and
+    # ifb1 will be automatically created.
+    if ! lsmod | grep -q '\<ifb\>'; then
+        printf "loading ifb module\n"
+        modprobe ifb numifbs=0
+    fi
+
+    if ! ip link show dev $IFB >& /dev/null; then
+        printf "Creating %s\n" "$IFB"
+        ip link add $IFB type ifb
+        ip link set dev $IFB up
+    fi
+
+    tc qdisc add dev $IFB root handle 1: netem
+
+    tc qdisc add dev $DEV ingress
+    filter-ip-sub $DEV ingress \
+        "match $PROT dst $PORT ffff action mirred egress redirect dev $IFB"
+}
+
+REST_QDISC=fq_codel
+IFB=ifb0
+
+function fail {
+    printf "$@" 1>&2
+    exit 1
+}
+
+case $1 in
+    setup)
+        DEV=$2
+        PROT=$3
+        PORT=$4
+
+        if [[ -z $DEV ]]; then fail "%s\n" "Error: DEV is required"; fi
+        if [[ -z $PROT ]]; then fail "%s\n" "Error: PROT is required"; fi
+        if [[ -z $PORT ]]; then fail "%s\n" "Error: PORT is required"; fi
+
+        printf "Setting up ingress filter on %s\n" "$DEV"
+        setup-netem-egress $DEV $PROT $PORT $REST_QDISC
+        printf "Setting up egress filter on %s\n" "$DEV"
+        setup-netem-ingress $DEV $PROT $PORT $IFB
+    ;;
+    remove)
+        DEV=$2
+
+        if [[ -z $DEV ]]; then fail "%s\n" "Error: DEV is required"; fi
+
+        printf "Removing qdiscs on %s\n" "$DEV"
+        tc qdisc del dev $DEV root || true
+        printf "Removing ingress qdisc on %s\n" "$DEV"
+        tc qdisc del dev $DEV ingress || true
+        printf "Removing %s\n" "$IFB"
+        ip link del dev $IFB || true
+    ;;
+    option)
+        DEV=$2
+        OPTIONS=$3
+        DIR=$4
+        if [[ $DIR == '' || $DIR == 'out' ]]; then
+            tc qdisc change dev $DEV parent 1:2 handle 20: netem $OPTIONS
+        fi
+        if [[ $DIR == '' || $DIR == 'in' ]]; then
+            tc qdisc change dev $IFB root handle 1: netem $OPTIONS
+        fi
+    ;;
+    *)
+        HELP="Usage: %s ACTION
+actions:
+    setup DEV PROT PORT    - Setup netem qdiscs on DEV for PROT PORT
+    remove DEV             - Remove qdiscs on DEV
+    option DEV OPTIONS DIR - Set netem options, see man tc-netem for OPTIONS
+
+Note: for ingress support $IFB is created on setup and deleted on remove
+
+Examples:
+    easynetem setup eth0 tcp 25565
+    easynetem option eth0 \"delay 100ms loss 1%% rate 3Mbit\"
+    easynetem option eth0 \"loss 100%%\" out
+    easynetem remove eth0
+"
+        printf "$HELP" "`basename "$0"`" 1>&2
+    ;;
+esac
